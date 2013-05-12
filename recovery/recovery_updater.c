@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 The Android Open Source Project
+ * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,123 +14,181 @@
  * limitations under the License.
  */
 
-#include <ctype.h>
+#include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mount.h>
-#include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
-#include "cutils/misc.h"
-#include "cutils/properties.h"
 #include "edify/expr.h"
-#include "mincrypt/sha.h"
-#include "minzip/DirUtil.h"
-#include "mtdutils/mounts.h"
-#include "mtdutils/mtdutils.h"
 
+// The bootloader block /dev/block/mmcblk0boot0 contains a low-level
+// bootloader (BL1/BL2) followed by a "boot flag", followed by a
+// primary copy of the full bootloader, then a backup copy of the full
+// bootloader.  The boot flag tells the low-level code which copy of
+// the big bootloader to boot.
+//
+// The strategy here is to read the boot flag, write the *other* copy
+// of the big bootloader, flip the boot flag to that freshly-written
+// copy, write remaining copy of the big bootloader, then flip the
+// flag back (so most of the time it will be booting the primary
+// copy).  At the end we update the BL1/BL2, which is slightly
+// dangerous (there's no backup; if we fail during writing this part
+// then the device is a brick).  We could remove that before launch,
+// or restrict it to only being written on test-keys/dev-keys devices.
 
-/* ioctl commands for /dev/dpram_recovery */
-#define IOCTL_MODEM_FW_UPDATE	_IO('D',0x1)
-#define IOCTL_MODEM_CHK_STAT	_IO('D',0x2)
-#define IOCTL_MODEM_PWROFF	_IO('D',0x3)
+#define BOOTFLAG_OFFSET (31*1024)
 
-/* modem status during update */
-struct stat_info {
-	int pct;
-	char msg[0x100];
-};
+#define BL1BL2_LENGTH (31*1024)
 
-/* buffer type for modem delta */
-struct dpram_firmware {
-	char *firmware;
-	int size;
-	int is_delta;
-};
+#define INPUT_OFFSET (35*1024)
+#define PRIMARY_OUTPUT_OFFSET (35*1024)
+#define SECONDARY_OUTPUT_OFFSET (1280*1024)
+#define BIG_LENGTH (1245*1024)
 
-Value* UpdateModemFn(const char* name, State* state,
-                     int argc, Expr* argv[]) {
-
-    struct dpram_firmware fw;
-    struct stat_info st;
-    int ofd = -1;
-    int err = -1;
-    int prev_pct = -1;
-
-    if (argc != 1)
-        return ErrorAbort(state, "%s() expects 1 arg, got %d", name, argc);
-
-    Value* radio;
-    if (ReadValueArgs(state, argv, 1, &radio) != 0) {
-        return NULL;
+static void copy_block(FILE *f, unsigned char* data, size_t in_offset,
+                       size_t length, size_t out_offset) {
+    if (fseek(f, out_offset, SEEK_SET) < 0) {
+        fprintf(stderr, "failed to seek to %d: %s\n",
+                out_offset, strerror(errno));
+        return;
     }
-    if (radio->type != VAL_BLOB) {
-        ErrorAbort(state, "argument to %s() has wrong type", name);
-        FreeValue(radio);
-        return NULL;
+    if (fwrite(data+in_offset, 1, length, f) != length) {
+        fprintf(stderr, "failed to write bootloader: %s\n", strerror(errno));
+        return;
     }
-
-    if (radio->size <= 0) {
-        fprintf(stderr, "%s(): no file contents received", name);
-        return StringValue(strdup(""));
-    }
-
-    printf("UpdateModemFn with %d bytes\n", radio->size);
-
-    /* open modem device */
-    ofd = open("/dev/modem_ctl", O_RDWR);
-
-    if (ofd < 0) {
-        printf("Unable to open modem device (%s)\n", strerror(errno));
-        goto out;
-    }
-
-    /* initiate firmware update */
-    fw.firmware = radio->data;
-    fw.size = radio->size;
-    fw.is_delta = 0;
-    err = ioctl(ofd, IOCTL_MODEM_FW_UPDATE, &fw);
-
-    if (err < 0) {
-        printf("ioctl failed with %d\n", err);
-        goto out;
-    }
-
-    do {
-        err = ioctl(ofd, IOCTL_MODEM_CHK_STAT, &st);
-        if (prev_pct != st.pct) {
-            /* use st.pct to update UI */
-            printf(" %3d \%\n", st.pct);
-            prev_pct = st.pct;
-        }
-
-        if (err < 0) {
-            /* Aborted if an error occurrs during update */
-            printf("Update error %d\n", err);
-            printf("Error msg : %s\n", st.msg);
-
-            ioctl(ofd, IOCTL_MODEM_PWROFF, NULL);
-            goto out;
-        }
-    } while (err);
-
-    printf("Firmware Update is Successful!\n");
-
-out:
-    FreeValue(radio);
-    if (ofd >= 0)
-        close(ofd);
-
-    return StringValue(strdup(err == 0 ? "t" : ""));
+    fflush(f);
+    fsync(fileno(f));
 }
 
-void Register_librecovery_updater_crespo4g() {
-    printf("Register_librecovery_updater_crespo4g is called\n");
-    RegisterFunction("samsung.update_modem", UpdateModemFn);
+static int get_bootflag(FILE *f) {
+    fseek(f, BOOTFLAG_OFFSET, SEEK_SET);
+    char buffer[8];
+    if (fread(buffer, 1, 8, f) != 8) {
+        fprintf(stderr, "failed to read boot flag: %s\n", strerror(errno));
+        return 0;
+    }
+
+    fprintf(stderr, "bootflag is [%c%c%c%c%c%c%c%c]\n",
+            buffer[0], buffer[1], buffer[2], buffer[3],
+            buffer[4], buffer[5], buffer[6], buffer[7]);
+
+    if (strncmp(buffer, "MANTABL", 7) != 0) return 0;
+    if (buffer[7] == '1') return 1;
+    if (buffer[7] == '2') return 2;
+    return 0;
+}
+
+static void set_bootflag(FILE* f, int value) {
+    unsigned char buffer[9] = "MANTABLx";
+    buffer[7] = '0' + value;
+    copy_block(f, buffer, 0, 8, BOOTFLAG_OFFSET);
+}
+
+static int update_bootloader(unsigned char* img_data,
+                             size_t img_size,
+                             char* block_fn,
+                             char* force_ro_fn) {
+    if (img_size != INPUT_OFFSET + BIG_LENGTH) {
+        fprintf(stderr, "expected bootloader.img of length %d; got %d\n",
+                INPUT_OFFSET + BIG_LENGTH, img_size);
+        return -1;
+    }
+
+
+    FILE* f = fopen(force_ro_fn, "w");
+    if (!f) {
+        fprintf(stderr, "failed to open %s: %s\n", force_ro_fn, strerror(errno));
+        return -1;
+    }
+    if (fwrite("0", 1, 1, f) != 1) {
+        fprintf(stderr, "failed to write %s: %s\n", force_ro_fn, strerror(errno));
+        return -1;
+    }
+    fflush(f);
+    fsync(fileno(f));
+    if (fclose(f) != 0) {
+        fprintf(stderr, "failed to close %s: %s\n", force_ro_fn, strerror(errno));
+        return -1;
+    }
+
+    f = fopen(block_fn, "r+b");
+    if (!f) {
+        fprintf(stderr, "failed to open %s: %s\n", block_fn, strerror(errno));
+        return -1;
+    }
+
+    int i;
+    int bootflag = 0;
+    for (i = 0; i < 2; ++i) {
+        bootflag = get_bootflag(f);
+
+        switch (bootflag) {
+            case 1:
+                fprintf(stderr, "updating secondary copy of bootloader\n");
+                copy_block(f, img_data, INPUT_OFFSET, BIG_LENGTH, SECONDARY_OUTPUT_OFFSET);
+                set_bootflag(f, 2);
+                break;
+            case 2:
+                fprintf(stderr, "updating primary copy of bootloader\n");
+                copy_block(f, img_data, INPUT_OFFSET, BIG_LENGTH, PRIMARY_OUTPUT_OFFSET);
+                set_bootflag(f, 1);
+                break;
+            case 0:
+                fprintf(stderr, "no bootflag; updating entire bootloader block\n");
+                copy_block(f, img_data, 0, img_size, 0);
+                i = 2;
+                break;
+        }
+    }
+
+    if (bootflag != 0) {
+        fprintf(stderr, "updating BL1/BL2\n");
+        copy_block(f, img_data, 0, BL1BL2_LENGTH, 0);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+Value* WriteBootloaderFn(const char* name, State* state, int argc, Expr* argv[])
+{
+    int result = -1;
+    Value* img;
+    Value* block_loc;
+    Value* force_ro_loc;
+
+    if (argc != 3) {
+        return ErrorAbort(state, "%s() expects 3 args, got %d", name, argc);
+    }
+
+    if (ReadValueArgs(state, argv, 3, &img, &block_loc, &force_ro_loc) < 0) {
+        return NULL;
+    }
+
+    if(img->type != VAL_BLOB ||
+       block_loc->type != VAL_STRING ||
+       force_ro_loc->type != VAL_STRING) {
+      FreeValue(img);
+      FreeValue(block_loc);
+      FreeValue(force_ro_loc);
+      return ErrorAbort(state, "%s(): argument types are incorrect", name);
+    }
+
+    result = update_bootloader(img->data, img->size,
+                               block_loc->data, force_ro_loc->data);
+    FreeValue(img);
+    FreeValue(block_loc);
+    FreeValue(force_ro_loc);
+    return StringValue(strdup(result == 0 ? "t" : ""));
+}
+
+void Register_librecovery_updater_manta() {
+    fprintf(stderr, "installing samsung.manta updater extensions\n");
+
+    RegisterFunction("samsung.manta.write_bootloader", WriteBootloaderFn);
 }

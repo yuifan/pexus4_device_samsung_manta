@@ -1,4 +1,4 @@
-# Copyright (C) 2010 The Android Open Source Project
+# Copyright (C) 2012 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,67 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
+"""Emit commands needed for Mantaray during OTA installation
+(installing the bootloader)."""
 
 import common
 
-def WriteRadio(info, radio_file):
-  radio_file.AddToZip(info.output_zip)
-  info.script.Print("Writing radio...")
-  info.script.AppendExtra(
-      'assert(samsung.update_modem(package_extract_file("%s")));\n' %
-      (radio_file.name,))
-
-def WriteBootloader(info, bootloader_file):
-  bootloader_file.AddToZip(info.output_zip)
-  info.script.Print("Writing bootloader...")
-  info.script.WriteRawImage("/bootloader", bootloader_file.name)
-
-def FindImage(zipfile, basename):
-  matches = []
-  for name in zipfile.namelist():
-    m = re.match(r"^RADIO/(" + basename + "[.](.+[.])?img)$", name)
-    if m:
-      matches.append((name, m.group(1)))
-  if len(matches) > 1:
-    raise ValueError("multiple radio images in target-files zip!")
-  if matches:
-    matches = matches[0]
-    print "using %s as %s" % matches
-    return common.File(matches[1], zipfile.read(matches[0]))
-  else:
-    return None
-
 def FullOTA_InstallEnd(info):
-  bootloader_img = FindImage(info.input_zip, "bootloader")
-  if bootloader_img:
+  try:
+    bootloader_img = info.input_zip.read("RADIO/bootloader.img")
+  except KeyError:
+    print "no bootloader.img in target_files; skipping install"
+  else:
     WriteBootloader(info, bootloader_img)
-  else:
-    print "no bootloader in target_files; skipping install"
 
-  radio_img = FindImage(info.input_zip, "radio")
-  if radio_img:
-    WriteRadio(info, radio_img)
-  else:
-    print "no radio in target_files; skipping install"
+def IncrementalOTA_VerifyEnd(info):
+  # try:
+  #   target_radio_img = info.target_zip.read("RADIO/radio.img")
+  #   source_radio_img = info.source_zip.read("RADIO/radio.img")
+  # except KeyError:
+  #   # No source or target radio. Nothing to verify
+  #   pass
+  # else:
+  #   if source_radio_img != target_radio_img:
+  #     info.script.CacheFreeSpaceCheck(len(source_radio_img))
+  #     radio_type, radio_device = common.GetTypeAndDevice("/radio", info.info_dict)
+  #     info.script.PatchCheck("%s:%s:%d:%s:%d:%s" % (
+  #         radio_type, radio_device,
+  #         len(source_radio_img), common.sha1(source_radio_img).hexdigest(),
+  #         len(target_radio_img), common.sha1(target_radio_img).hexdigest()))
+  pass
 
 def IncrementalOTA_InstallEnd(info):
-  tf = FindImage(info.target_zip, "bootloader")
-  sf = FindImage(info.source_zip, "bootloader")
+  try:
+    target_bootloader_img = info.target_zip.read("RADIO/bootloader.img")
+    try:
+      source_bootloader_img = info.source_zip.read("RADIO/bootloader.img")
+    except KeyError:
+      source_bootloader_img = None
 
-  if not tf:
-    print "no bootloader image in target target_files; skipping"
-  elif sf and tf.sha1 == sf.sha1:
-    print "bootloader image unchanged; skipping"
-  else:
-    WriteBootloader(info, sf)
+    if source_bootloader_img == target_bootloader_img:
+      print "bootloader unchanged; skipping"
+    else:
+      WriteBootloader(info, target_bootloader_img)
+  except KeyError:
+    print "no bootloader.img in target target_files; skipping install"
 
-  tf = FindImage(info.target_zip, "radio")
-  sf = FindImage(info.source_zip, "radio")
+def WriteBootloader(info, bootloader_img):
+  common.ZipWriteStr(info.output_zip, "bootloader.img", bootloader_img)
+  bl_type, bl_device = common.GetTypeAndDevice("/bootloader", info.info_dict)
 
-  if not tf:
-    print "no radio image in target target_files; skipping"
-  elif sf and tf.sha1 == sf.sha1:
-    print "radio image unchanged; skipping"
-  else:
-    WriteRadio(info, tf)
+  fstab = info.info_dict["fstab"]
+
+  info.script.Print("Writing bootloader...")
+  force_ro = "/sys/block/" + bl_device.split("/")[-1] + "/force_ro"
+  info.script.AppendExtra(
+      ('samsung.manta.write_bootloader(package_extract_file('
+       '"bootloader.img"), "%s", "%s");') %
+      (bl_device, force_ro))
